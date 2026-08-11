@@ -3,6 +3,7 @@
 
 import { describe, expect, it } from 'bun:test';
 import type { SchemaPackManifest } from '../src/core/schema-pack/manifest-v1.ts';
+import { inferTypeFromPack } from '../src/core/markdown.ts';
 import {
   aliasShadowsType,
   aliasDeclaredByTwoTypes,
@@ -255,15 +256,29 @@ describe('prefixStrictSubsetOverlap', () => {
     expect(await prefixStrictSubsetOverlap(m)).toEqual([]);
   });
 
-  it('flags one type prefix that is a strict subset of another', async () => {
+  it('does not warn when specific prefixes precede the broad fallback', async () => {
     const m = mk({ page_types: [
-      baseType({ name: 'researcher', prefixes: ['people/researchers/'] }),
+      baseType({ name: 'pattern', prefixes: ['originals/patterns/'] }),
+      baseType({ name: 'reflection', prefixes: ['originals/reflections/'] }),
+      baseType({ name: 'original', prefixes: ['originals/'] }),
+    ] });
+
+    expect(await prefixStrictSubsetOverlap(m)).toEqual([]);
+    expect(inferTypeFromPack('originals/patterns/x.md', m)).toBe('pattern');
+    expect(inferTypeFromPack('originals/reflections/y.md', m)).toBe('reflection');
+    expect(inferTypeFromPack('originals/z.md', m)).toBe('original');
+  });
+
+  it('warns when a broad fallback precedes and shadows a specific prefix', async () => {
+    const m = mk({ page_types: [
       baseType({ name: 'person', prefixes: ['people/'] }),
+      baseType({ name: 'researcher', prefixes: ['people/researchers/'] }),
     ] });
     const issues = await prefixStrictSubsetOverlap(m);
-    // strict-subset detection fires for the researcher prefix.
-    expect(issues.length).toBeGreaterThanOrEqual(1);
+    expect(issues.length).toBe(1);
     expect(issues[0]!.severity).toBe('warning');
+    expect(issues[0]!.message).toContain('type researcher');
+    expect(issues[0]!.hint).toContain("BEFORE 'person'");
   });
 
   it('does not flag identical prefixes (that is prefixCollision territory)', async () => {

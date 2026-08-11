@@ -209,22 +209,31 @@ export const prefixCollision: LintRule = (manifest) => {
 
 export const prefixStrictSubsetOverlap: LintRule = (manifest) => {
   const issues: LintIssue[] = [];
-  // Build (prefix, owningType) pairs.
-  const pairs: Array<{ prefix: string; type: string }> = [];
-  for (const t of manifest.page_types) {
-    for (const p of t.path_prefixes) pairs.push({ prefix: p, type: t.name });
+  // Build (prefix, owningType, declaration order) tuples. Type inference is
+  // first-match-wins, so overlap is only hazardous when the broad fallback
+  // appears BEFORE the more specific type and shadows it.
+  const pairs: Array<{ prefix: string; type: string; typeIndex: number }> = [];
+  for (let typeIndex = 0; typeIndex < manifest.page_types.length; typeIndex++) {
+    const t = manifest.page_types[typeIndex]!;
+    for (const p of t.path_prefixes) pairs.push({ prefix: p, type: t.name, typeIndex });
   }
   for (let i = 0; i < pairs.length; i++) {
     for (let j = 0; j < pairs.length; j++) {
       if (i === j) continue;
       const a = pairs[i]!;
       const b = pairs[j]!;
-      // a is strict subset of b: a starts with b AND a !== b.
-      if (a.prefix !== b.prefix && a.prefix.startsWith(b.prefix) && a.type !== b.type) {
+      // a is the narrower prefix and b is the broad fallback. Warn only when
+      // b is earlier in page_types[] and therefore wins before a is reached.
+      if (
+        a.prefix !== b.prefix
+        && a.prefix.startsWith(b.prefix)
+        && a.type !== b.type
+        && b.typeIndex < a.typeIndex
+      ) {
         issues.push({
           rule: 'prefix_strict_subset_overlap',
           severity: 'warning',
-          message: `path_prefix '${a.prefix}' (type ${a.type}) is a strict subset of '${b.prefix}' (type ${b.type}); inference precedence is first-match-wins`,
+          message: `path_prefix '${a.prefix}' (type ${a.type}) is shadowed by earlier broader prefix '${b.prefix}' (type ${b.type}); inference is first-match-wins`,
           pack: manifest.name,
           hint: `ensure '${a.type}' is declared BEFORE '${b.type}' in page_types[] so the specific prefix wins`,
         });
