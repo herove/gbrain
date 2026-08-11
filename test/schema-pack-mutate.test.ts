@@ -278,7 +278,8 @@ describe('addAliasToType', () => {
     await withEnv({ GBRAIN_HOME: tmpDir, GBRAIN_AUDIT_DIR: auditDir }, async () => {
       const path = seedPack('mine', 'json');
       // Alias 'individual' is NOT another declared type, so alias_shadows_type does not fire.
-      // alias_references_undeclared_type is a WARNING (not error), so validation gate passes.
+      // Alias targets are open strings, so this legacy type is valid even
+      // though it is not also declared as a canonical page_type.
       await addAliasToType('mine', 'person', 'individual', { lockDir });
       const after = loadPackFromFile(path);
       expect(after.page_types.find((t) => t.name === 'person')!.aliases).toEqual(['individual']);

@@ -91,29 +91,6 @@ export const aliasDeclaredByTwoTypes: LintRule = (manifest) => {
   return issues;
 };
 
-export const aliasReferencesUndeclaredType: LintRule = (manifest) => {
-  // codex C14 — alias should be a known type OR a known alias of another
-  // type. For v0.40.6.0 we lint the simpler case: alias must match a
-  // declared page_type name. Closure validation is a v0.41+ extension.
-  const issues: LintIssue[] = [];
-  const typeNames = new Set(manifest.page_types.map((t) => t.name));
-  for (const t of manifest.page_types) {
-    for (const a of t.aliases) {
-      if (!typeNames.has(a)) {
-        issues.push({
-          rule: 'alias_references_undeclared_type',
-          severity: 'warning',
-          message: `type '${t.name}' aliases '${a}' which is not a declared page_type in this pack`,
-          pack: manifest.name,
-          type: t.name,
-          hint: `add a page_type for '${a}' OR remove the alias`,
-        });
-      }
-    }
-  }
-  return issues;
-};
-
 export const enrichableTypesUndeclared: LintRule = (manifest) => {
   const issues: LintIssue[] = [];
   const typeNames = new Set(manifest.page_types.map((t) => t.name));
@@ -352,7 +329,6 @@ export const linkRegexCatastrophicBacktrack: LintRule = (manifest) => {
 export const ALL_LINT_RULES: ReadonlyArray<{ name: string; rule: LintRule; planeAware: boolean }> = [
   { name: 'alias_shadows_type', rule: aliasShadowsType, planeAware: false },
   { name: 'alias_declared_by_two_types', rule: aliasDeclaredByTwoTypes, planeAware: false },
-  { name: 'alias_references_undeclared_type', rule: aliasReferencesUndeclaredType, planeAware: false },
   { name: 'enrichable_types_undeclared', rule: enrichableTypesUndeclared, planeAware: false },
   { name: 'link_types_undeclared', rule: linkTypesUndeclared, planeAware: false },
   { name: 'frontmatter_links_undeclared', rule: frontmatterLinksUndeclared, planeAware: false },
@@ -399,8 +375,9 @@ export async function runAllLintRules(
 
 /**
  * Run only file-plane rules. Used by `withMutation`'s pre-write
- * validation gate so a mutation that creates a dangling ref fails
- * BEFORE the atomic write happens.
+ * validation gate so a mutation that creates an invalid cross-reference
+ * fails BEFORE the atomic write happens. Alias targets are intentionally
+ * open strings: legacy/organic page types need not be canonical page_types.
  *
  * Returns the same shape as runAllLintRules but skips DB-aware checks.
  */

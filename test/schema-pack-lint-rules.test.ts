@@ -1,13 +1,11 @@
-// v0.40.6.0 — lint-rules.ts unit tests. 36 cases (11 rules covering each
-// of clean / single-violation / multi-violation paths plus the audit-aware
-// rule's empty-DB and audit-best-effort paths).
+// v0.40.6.0 — lint-rules.ts unit tests covering clean, single-violation,
+// multi-violation, empty-DB, and audit-best-effort paths.
 
 import { describe, expect, it } from 'bun:test';
 import type { SchemaPackManifest } from '../src/core/schema-pack/manifest-v1.ts';
 import {
   aliasShadowsType,
   aliasDeclaredByTwoTypes,
-  aliasReferencesUndeclaredType,
   enrichableTypesUndeclared,
   linkTypesUndeclared,
   frontmatterLinksUndeclared,
@@ -99,26 +97,15 @@ describe('aliasDeclaredByTwoTypes', () => {
   });
 });
 
-describe('aliasReferencesUndeclaredType', () => {
-  it('clean: aliases all match declared types', async () => {
+describe('open alias targets', () => {
+  it('accepts legacy page types that are not canonical page_types', async () => {
     const m = mk({ page_types: [
-      baseType({ name: 'person' }),
-      baseType({ name: 'researcher', aliases: ['person'] }),
+      baseType({ name: 'person', aliases: ['contact', 'founder', 'partner-profile'] }),
+      baseType({ name: 'media', aliases: ['article', 'youtube-video'] }),
     ] });
-    expect(await aliasReferencesUndeclaredType(m)).toEqual([]);
-  });
-
-  it('flags alias pointing at undeclared type', async () => {
-    const m = mk({ page_types: [baseType({ name: 'r', aliases: ['ghost'] })] });
-    const issues = await aliasReferencesUndeclaredType(m);
-    expect(issues.length).toBe(1);
-    expect(issues[0]!.severity).toBe('warning');
-    expect(issues[0]!.message).toContain('ghost');
-  });
-
-  it('flags multiple undeclared references separately', async () => {
-    const m = mk({ page_types: [baseType({ name: 'r', aliases: ['g1', 'g2'] })] });
-    expect((await aliasReferencesUndeclaredType(m)).length).toBe(2);
+    const report = await runFilePlaneLintRules(m);
+    expect(report).toEqual({ ok: true, errors: [], warnings: [] });
+    expect(ALL_LINT_RULES.map((r) => r.name)).not.toContain('alias_references_undeclared_type');
   });
 });
 
@@ -332,13 +319,13 @@ describe('runAllLintRules — composition', () => {
 });
 
 describe('rule registry shape', () => {
-  it('ALL_LINT_RULES contains 12 rules', () => {
+  it('ALL_LINT_RULES contains 11 rules', () => {
     // v0.41.37.0 #1569 added link_regex_catastrophic_backtrack (file-plane).
-    expect(ALL_LINT_RULES.length).toBe(12);
+    expect(ALL_LINT_RULES.length).toBe(11);
   });
 
   it('FILE_PLANE_LINT_RULES excludes the 2 DB-aware rules', () => {
-    expect(FILE_PLANE_LINT_RULES.length).toBe(10);
+    expect(FILE_PLANE_LINT_RULES.length).toBe(9);
     expect(FILE_PLANE_LINT_RULES.every((r) => !r.planeAware)).toBe(true);
   });
 
