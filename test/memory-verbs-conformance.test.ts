@@ -20,7 +20,7 @@
  *   - fixture mirror drift guard (cases.json === embedded module)
  */
 
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'bun:test';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'bun:test';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -40,6 +40,7 @@ import { CONFORMANCE_CASES } from '../src/core/verbs/conformance-fixtures.ts';
 import { writeSingleFact } from '../src/core/facts/write-single.ts';
 import {
   configureGateway,
+  resetGateway,
   __setChatTransportForTests,
   __setEmbedTransportForTests,
 } from '../src/core/ai/gateway.ts';
@@ -60,12 +61,25 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await engine.disconnect();
+  resetGateway();
   __setUsageLogPathForTests(null);
   try { rmSync(home, { recursive: true, force: true }); } catch { /* best-effort */ }
 });
 
 beforeEach(async () => {
   await resetPgliteState(engine);
+  // The deterministic dedup test installs a fake OpenAI config. Reset the
+  // process-global gateway before the next test so later conformance calls do
+  // not attempt real embedding requests with that fake credential.
+  resetGateway();
+  __setChatTransportForTests(null);
+  __setEmbedTransportForTests(null);
+});
+
+afterEach(() => {
+  // Do not leave a fake provider visible to another file when Bun schedules
+  // test files concurrently in the same process.
+  resetGateway();
   __setChatTransportForTests(null);
   __setEmbedTransportForTests(null);
 });

@@ -237,6 +237,42 @@ export interface ImportResult {
   flag_reason?: 'markup_heavy' | 'oversized';
 }
 
+export async function loadImportSourcePolicy(
+  engine: BrainEngine,
+  sourceId: string,
+): Promise<{
+  id: string;
+  contextual_retrieval_mode: string | null;
+  trust_frontmatter_overrides: boolean;
+}> {
+  try {
+    const rows = await engine.executeRaw<{
+      id: string;
+      contextual_retrieval_mode?: string | null;
+      trust_frontmatter_overrides?: boolean;
+    }>(
+      `SELECT id, contextual_retrieval_mode, trust_frontmatter_overrides
+         FROM sources
+        WHERE id = $1`,
+      [sourceId],
+    );
+    if (Array.isArray(rows) && rows[0]) {
+      return {
+        id: rows[0].id,
+        contextual_retrieval_mode: rows[0].contextual_retrieval_mode ?? null,
+        trust_frontmatter_overrides: rows[0].trust_frontmatter_overrides === true,
+      };
+    }
+  } catch {
+    // Compatibility fallback for pre-source engines and structural test doubles.
+  }
+  return {
+    id: sourceId,
+    contextual_retrieval_mode: null,
+    trust_frontmatter_overrides: false,
+  };
+}
+
 const MAX_FILE_SIZE = 5_000_000; // 5MB
 
 /**
@@ -749,15 +785,13 @@ export async function importFromContent(
   if (!opts.noEmbed) {
     const searchInput = await loadSearchModeConfig(engine);
     const knobs = resolveSearchMode(searchInput);
-    // Look up the source row for this import; default to host trust when
-    // the engine's getConfig path doesn't surface a source row (most calls).
+    // Resolve the actual selected source policy. Hard-coding NULL mode here
+    // made source-scoped imports inherit and permanently stamp the global CR
+    // shape even when their source explicitly selected another mode.
+    const sourcePolicy = await loadImportSourcePolicy(engine, sourceId ?? 'default');
     const resolution = resolveContextualRetrievalMode({
       pageFrontmatter: parsed.frontmatter,
-      source: {
-        id: sourceId ?? 'default',
-        contextual_retrieval_mode: null,
-        trust_frontmatter_overrides: false,
-      },
+      source: sourcePolicy,
       globalMode: knobs.contextual_retrieval,
       killSwitchDisabled: knobs.contextual_retrieval_disabled,
     });

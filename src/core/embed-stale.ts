@@ -18,11 +18,17 @@
  */
 
 import type { BrainEngine } from './engine.ts';
-import type { ChunkInput } from './types.ts';
-import { embedBatchWithBackoff, restampIfDemotedToTitleTier } from '../commands/embed.ts';
-import { wrapChunkTextsForStoredMode } from './embedding-context.ts';
+import {
+  embedBatchWithBackoff,
+  preparePlainReembedInputs,
+  restampPlainReembedState,
+} from '../commands/embed.ts';
 import { type DbPacer, createNoopPacer, observed } from './db-pacer.ts';
 import { AbortError } from './abort-check.ts';
+import {
+  applyChunkEmbeddingsIfUnchanged,
+  isPageFullyEmbeddedAtSnapshot,
+} from './chunk-embedding-cas.ts';
 
 /** Last visited (page_id, chunk_index) for keyset-resume across runs. */
 export interface StaleCursor {
@@ -197,59 +203,61 @@ export async function embedStaleForSource(
         const pageRow = await observed(pacer, () =>
           engine.getPage(slug, { sourceId: keySourceId }),
         );
-        const embeddings = await embedFn(
-          wrapChunkTextsForStoredMode(pageRow, stale),
-          { abortSignal: signal },
-        );
         const existing = await observed(pacer, () =>
           engine.getChunks(slug, { sourceId: keySourceId }),
         );
-        const staleIdxToEmbedding = new Map<number, Float32Array>();
-        for (let j = 0; j < stale.length; j++) {
-          staleIdxToEmbedding.set(stale[j].chunk_index, embeddings[j]);
-        }
-        const merged: ChunkInput[] = existing.map((c) => ({
-          chunk_index: c.chunk_index,
-          chunk_text: c.chunk_text,
-          chunk_source: c.chunk_source,
-          embedding: staleIdxToEmbedding.get(c.chunk_index) ?? undefined,
-          token_count: c.token_count || Math.ceil(c.chunk_text.length / 4),
-          // Carry through per-chunk metadata. upsertChunks writes these as
-          // EXCLUDED.<col> (not COALESCE), so omitting them here resets image
-          // rows to modality='text' (breaking the image search arm's
-          // modality='image' filter) and wipes code-chunk symbol metadata on
-          // every embed-stale pass. embedding_image is deliberately NOT
-          // carried: the upsert COALESCEs it, and getChunks returns the
-          // pgvector as a string which upsertChunks would mis-serialize.
-          modality: c.modality ?? undefined,
-          language: c.language ?? undefined,
-          symbol_name: c.symbol_name ?? undefined,
-          symbol_type: c.symbol_type ?? undefined,
-          start_line: c.start_line ?? undefined,
-          end_line: c.end_line ?? undefined,
-          parent_symbol_path: c.parent_symbol_path ?? undefined,
-          doc_comment: c.doc_comment ?? undefined,
-          symbol_name_qualified: c.symbol_name_qualified ?? undefined,
+        const reembedInputs = await preparePlainReembedInputs(
+          engine,
+          pageRow,
+          stale,
+          keySourceId,
+          stale.length === existing.length,
+        );
+        const embeddings = await embedFn(
+          reembedInputs.texts,
+          { abortSignal: signal },
+        );
+        const candidates = stale.map((chunk, index) => ({
+          chunk_index: chunk.chunk_index,
+          chunk_text: chunk.chunk_text,
+          chunk_source: chunk.chunk_source,
+          embedding: embeddings[index],
         }));
-        await observed(pacer, () => engine.upsertChunks(slug, merged, { sourceId: keySourceId }));
+        const applied = await observed(pacer, () =>
+          applyChunkEmbeddingsIfUnchanged(engine, slug, keySourceId, candidates),
+        );
+        const fullyApplied = applied.size === stale.length
+          && stale.length === existing.length
+          && await observed(pacer, () => isPageFullyEmbeddedAtSnapshot(
+            engine,
+            slug,
+            keySourceId,
+            existing.length,
+            pageRow?.content_hash,
+          ));
         // v0.41.31: stamp provenance only when EVERY chunk was stale (fully
         // re-embedded this pass) — a partially-stale page keeps preserved
         // chunks of unknown provenance, so don't claim current. After the
         // invalidate pass above, signature-drifted pages ARE fully stale.
-        if (signature && stale.length === existing.length) {
+        if (signature && fullyApplied) {
           await observed(pacer, () =>
             engine.setPageEmbeddingSignature(slug, { sourceId: keySourceId, signature }),
           );
         }
         // #3507: a FULLY re-embedded per_chunk_synopsis page landed at the
         // title tier — keep the stamped mode honest (mixed pages stay as-is).
-        if (stale.length === existing.length) {
+        if (fullyApplied) {
           await observed(pacer, () =>
-            restampIfDemotedToTitleTier(engine, pageRow, slug, keySourceId),
+            restampPlainReembedState(engine, reembedInputs, slug, keySourceId),
           );
         }
-        result.embedded += stale.length;
-        result.pagesProcessed += 1;
+        result.embedded += applied.size;
+        if (applied.size > 0) result.pagesProcessed += 1;
+        if (applied.size !== stale.length) {
+          process.stderr.write(
+            `\n  [embed-stale] ${keySourceId}/${slug}: ${stale.length - applied.size} chunk(s) changed while embedding; left stale for retry\n`,
+          );
+        }
       } catch (e: unknown) {
         // Aborted mid-fetch is expected; treat as graceful exit.
         if (signal?.aborted) return;

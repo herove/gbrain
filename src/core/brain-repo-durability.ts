@@ -31,7 +31,13 @@ import {
   existsSync, readFileSync, writeFileSync, mkdirSync, chmodSync, rmSync, statSync, appendFileSync,
 } from 'fs';
 import { join, dirname, relative, isAbsolute } from 'path';
-import { execFileSync, execSync } from 'child_process';
+import { mkdtempSync } from 'fs';
+import { tmpdir } from 'os';
+import {
+  execFileSync,
+  execSync,
+  type ExecFileSyncOptionsWithStringEncoding,
+} from 'child_process';
 import {
   GIT_ENV, GIT_ENV_AUTH, divergenceSafePull, detectDefaultBranch, pushProbe,
   type PullOutcome, type PushProbeResult,
@@ -385,6 +391,129 @@ export function commitWriteThroughFile(repoPath: string, absPath: string, slug: 
     return true;
   } catch {
     return false;
+  }
+}
+
+/**
+ * Commit an exact caller-supplied file body without re-reading the worktree.
+ *
+ * Facts fence writes have an external await (the DB stamp) between rename and
+ * Git durability. A human editor can change the same file in that window. The
+ * normal path-limited `git commit -- <path>` reads the worktree at commit time,
+ * so it can accidentally commit/push that unrelated edit. This variant builds
+ * a commit from a private index containing the expected blob, atomically moves
+ * the branch only if HEAD is unchanged, then updates only the real index entry.
+ * A concurrent worktree edit remains dirty and is never included in the commit.
+ */
+export function commitWriteThroughExpectedContent(
+  repoPath: string,
+  absPath: string,
+  slug: string,
+  expectedContent: string,
+): boolean {
+  let tempDir: string | undefined;
+  try {
+    const rel = relative(repoPath, absPath);
+    if (!rel || rel.startsWith('..') || isAbsolute(rel)) return false;
+    const baseEnv = { ...process.env, ...GIT_ENV };
+    const outputOpts: ExecFileSyncOptionsWithStringEncoding = {
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 30_000,
+      env: baseEnv,
+    };
+    const head = execFileSync('git', ['-C', repoPath, 'rev-parse', 'HEAD'], outputOpts).trim();
+    const branchRef = execFileSync(
+      'git',
+      ['-C', repoPath, 'symbolic-ref', '-q', 'HEAD'],
+      outputOpts,
+    ).trim();
+    if (!branchRef) return false;
+
+    const headEntry = execFileSync(
+      'git',
+      ['-C', repoPath, 'ls-tree', head, '--', rel],
+      outputOpts,
+    ).trim();
+    const mode = headEntry ? headEntry.split(/\s+/, 1)[0] : '100644';
+    const originalIndexEntry = execFileSync(
+      'git',
+      ['-C', repoPath, 'ls-files', '-s', '--', rel],
+      outputOpts,
+    ).trim();
+    const blob = execFileSync(
+      'git',
+      ['-C', repoPath, 'hash-object', '-w', '--stdin'],
+      {
+        ...outputOpts,
+        input: expectedContent,
+        stdio: ['pipe', 'pipe', 'ignore'],
+      },
+    ).trim();
+
+    tempDir = mkdtempSync(join(tmpdir(), 'gbrain-expected-index-'));
+    const privateIndex = join(tempDir, 'index');
+    const privateEnv = { ...baseEnv, GIT_INDEX_FILE: privateIndex };
+    execFileSync('git', ['-C', repoPath, 'read-tree', head], {
+      ...outputOpts,
+      env: privateEnv,
+    });
+    execFileSync(
+      'git',
+      ['-C', repoPath, 'update-index', '--add', '--cacheinfo', mode, blob, rel],
+      { ...outputOpts, env: privateEnv },
+    );
+    const tree = execFileSync('git', ['-C', repoPath, 'write-tree'], {
+      ...outputOpts,
+      env: privateEnv,
+    }).trim();
+    const headTree = execFileSync(
+      'git',
+      ['-C', repoPath, 'rev-parse', `${head}^{tree}`],
+      outputOpts,
+    ).trim();
+    if (tree === headTree) return true;
+
+    const commit = execFileSync(
+      'git',
+      ['-C', repoPath, 'commit-tree', tree, '-p', head, '-m', `gbrain: write-through ${slug}`],
+      outputOpts,
+    ).trim();
+    execFileSync('git', ['-C', repoPath, 'update-ref', branchRef, commit, head], {
+      ...outputOpts,
+      stdio: 'ignore',
+    });
+
+    // Keep the caller's normal index coherent, but only if nobody staged this
+    // path since our initial clean snapshot. The branch commit is already
+    // content-exact either way; skipping here merely leaves a visible index
+    // difference for the concurrent editor to resolve.
+    const currentIndexEntry = execFileSync(
+      'git',
+      ['-C', repoPath, 'ls-files', '-s', '--', rel],
+      outputOpts,
+    ).trim();
+    if (currentIndexEntry === originalIndexEntry) {
+      execFileSync(
+        'git',
+        ['-C', repoPath, 'update-index', '--add', '--cacheinfo', mode, blob, rel],
+        { ...outputOpts, stdio: 'ignore' },
+      );
+    }
+
+    // commit-tree intentionally bypasses porcelain hooks. Re-run the local,
+    // untracked post-commit hook so durability hardening keeps its push path.
+    try {
+      execFileSync('git', ['-C', repoPath, 'hook', 'run', 'post-commit'], {
+        ...outputOpts,
+        stdio: 'ignore',
+      });
+    } catch { /* best-effort, matching normal post-commit semantics */ }
+    return true;
+  } catch {
+    return false;
+  } finally {
+    if (tempDir) rmSync(tempDir, { recursive: true, force: true });
   }
 }
 

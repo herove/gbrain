@@ -8,10 +8,12 @@ import { MinionQueue } from '../core/minions/queue.ts';
 import { MinionWorker } from '../core/minions/worker.ts';
 import { WORKER_EXIT_RSS_WATCHDOG } from '../core/minions/worker-exit-codes.ts';
 import type { MinionHandler, MinionJob, MinionJobStatus } from '../core/minions/types.ts';
-import type { PaceKeyOverrides } from '../core/pace-mode.ts';
+import { isPaceMode, type PaceKeyOverrides } from '../core/pace-mode.ts';
+import type { EmbedOpts, EmbedResult } from './embed.ts';
 import { loadConfig, isThinClient } from '../core/config.ts';
 import { callRemoteTool, unpackToolResult } from '../core/mcp-client.ts';
 import { parseNiceValue, applyNiceness, getEffectiveNiceness, formatNice } from '../core/minions/niceness.ts';
+import { throwIfAborted } from '../core/abort-check.ts';
 
 function parseFlag(args: string[], flag: string): string | undefined {
   const idx = args.indexOf(flag);
@@ -73,6 +75,201 @@ function registerBuiltinJob(
     await refreshGatewayForJob(engine);
     return await handler(job);
   });
+}
+
+/**
+ * Parse the untrusted, persisted payload for an embed Minion job. Keeping this
+ * strict prevents malformed booleans or nested pace data from widening a
+ * queued operation after the foreground CLI has exited.
+ */
+export function resolveEmbedJobData(data: Record<string, unknown>): {
+  slug?: string;
+  slugs?: string[];
+  all: boolean;
+  stale: boolean;
+  dryRun?: boolean;
+  sourceId?: string;
+  batchSize?: number;
+  priority?: 'recent';
+  catchUp?: boolean;
+  includeNullSignature?: boolean;
+  pace?: { perCallMode?: string; perCall?: PaceKeyOverrides };
+  paceFromBackground?: boolean;
+} {
+  const optionalBoolean = (key: string): boolean | undefined => {
+    const value = data[key];
+    if (value === undefined) return undefined;
+    if (typeof value !== 'boolean') {
+      throw new Error(`embed job data.${key} must be a boolean`);
+    }
+    return value;
+  };
+  const optionalString = (key: string): string | undefined => {
+    const value = data[key];
+    if (value === undefined) return undefined;
+    if (typeof value !== 'string' || value.trim().length === 0) {
+      throw new Error(`embed job data.${key} must be a non-empty string`);
+    }
+    return value;
+  };
+
+  const all = optionalBoolean('all') === true;
+  const stale = optionalBoolean('stale');
+  const dryRun = optionalBoolean('dryRun');
+  const catchUp = optionalBoolean('catchUp');
+  const includeNullSignature = optionalBoolean('includeNullSignature');
+  const slug = optionalString('slug');
+  const sourceId = optionalString('sourceId');
+
+  let slugs: string[] | undefined;
+  if (data.slugs !== undefined) {
+    if (!Array.isArray(data.slugs) || data.slugs.length === 0 || data.slugs.some((v) => typeof v !== 'string' || v.trim().length === 0)) {
+      throw new Error('embed job data.slugs must be a non-empty array of non-empty strings');
+    }
+    slugs = data.slugs as string[];
+  }
+
+  const explicitTargetCount = Number(all) + Number(slug !== undefined) + Number(slugs !== undefined);
+  if (explicitTargetCount > 1) {
+    throw new Error('embed job data must select exactly one of all, slug, or slugs');
+  }
+  if (stale === true && (slug !== undefined || slugs !== undefined)) {
+    throw new Error('embed job data.stale cannot be combined with slug or slugs');
+  }
+
+  let batchSize: number | undefined;
+  if (data.batchSize !== undefined) {
+    if (typeof data.batchSize !== 'number' || !Number.isFinite(data.batchSize) || data.batchSize < 1) {
+      throw new Error('embed job data.batchSize must be a positive number');
+    }
+    batchSize = Math.min(10_000, Math.trunc(data.batchSize));
+  }
+
+  let priority: 'recent' | undefined;
+  if (data.priority !== undefined) {
+    if (data.priority !== 'recent') {
+      throw new Error('embed job data.priority must be "recent"');
+    }
+    priority = 'recent';
+  }
+
+  let pace: { perCallMode?: string; perCall?: PaceKeyOverrides } | undefined;
+  if (data.pace !== undefined) {
+    if (data.pace === null || typeof data.pace !== 'object' || Array.isArray(data.pace)) {
+      throw new Error('embed job data.pace must be an object');
+    }
+    const rawPace = data.pace as Record<string, unknown>;
+    const unexpectedPaceKey = Object.keys(rawPace).find(
+      (key) => key !== 'perCallMode' && key !== 'perCall',
+    );
+    if (unexpectedPaceKey) {
+      throw new Error(`embed job data.pace.${unexpectedPaceKey} is not supported`);
+    }
+
+    let perCallMode: string | undefined;
+    if (rawPace.perCallMode !== undefined) {
+      if (typeof rawPace.perCallMode !== 'string') {
+        throw new Error('embed job data.pace.perCallMode must be a pace mode');
+      }
+      const normalizedMode = rawPace.perCallMode.trim().toLowerCase();
+      if (!isPaceMode(normalizedMode)) {
+        throw new Error('embed job data.pace.perCallMode must be one of off, gentle, balanced, aggressive');
+      }
+      perCallMode = normalizedMode;
+    }
+
+    let perCall: PaceKeyOverrides | undefined;
+    if (rawPace.perCall !== undefined) {
+      if (rawPace.perCall === null || typeof rawPace.perCall !== 'object' || Array.isArray(rawPace.perCall)) {
+        throw new Error('embed job data.pace.perCall must be an object');
+      }
+      const rawPerCall = rawPace.perCall as Record<string, unknown>;
+      const allowedKeys = new Set(['enabled', 'maxConcurrency', 'paceAtMs', 'maxSleepMs', 'ewmaAlpha']);
+      const unexpectedPerCallKey = Object.keys(rawPerCall).find((key) => !allowedKeys.has(key));
+      if (unexpectedPerCallKey) {
+        throw new Error(`embed job data.pace.perCall.${unexpectedPerCallKey} is not supported`);
+      }
+      const parsed: PaceKeyOverrides = {};
+      if (rawPerCall.enabled !== undefined) {
+        if (typeof rawPerCall.enabled !== 'boolean') {
+          throw new Error('embed job data.pace.perCall.enabled must be a boolean');
+        }
+        parsed.enabled = rawPerCall.enabled;
+      }
+      const boundedInteger = (key: 'maxConcurrency' | 'paceAtMs' | 'maxSleepMs', min: number, max?: number): number | undefined => {
+        const value = rawPerCall[key];
+        if (value === undefined) return undefined;
+        if (typeof value !== 'number' || !Number.isInteger(value) || value < min || (max !== undefined && value > max)) {
+          const range = max === undefined ? `an integer >= ${min}` : `an integer in [${min}, ${max}]`;
+          throw new Error(`embed job data.pace.perCall.${key} must be ${range}`);
+        }
+        return value;
+      };
+      const maxConcurrency = boundedInteger('maxConcurrency', 1, 256);
+      const paceAtMs = boundedInteger('paceAtMs', 0);
+      const maxSleepMs = boundedInteger('maxSleepMs', 0);
+      if (maxConcurrency !== undefined) parsed.maxConcurrency = maxConcurrency;
+      if (paceAtMs !== undefined) parsed.paceAtMs = paceAtMs;
+      if (maxSleepMs !== undefined) parsed.maxSleepMs = maxSleepMs;
+      if (rawPerCall.ewmaAlpha !== undefined) {
+        const value = rawPerCall.ewmaAlpha;
+        if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0 || value > 1) {
+          throw new Error('embed job data.pace.perCall.ewmaAlpha must be a number in (0, 1]');
+        }
+        parsed.ewmaAlpha = value;
+      }
+      perCall = parsed;
+    }
+    pace = {
+      ...(perCallMode !== undefined && { perCallMode }),
+      ...(perCall !== undefined && { perCall }),
+    };
+  }
+
+  return {
+    slug,
+    slugs,
+    all,
+    // Legacy payloads sometimes omitted `stale`. Default to the bounded
+    // positional target when one is present; only a payload with no explicit
+    // target gets the historical stale-pool default.
+    stale: all ? false : (slug !== undefined || slugs !== undefined ? false : stale !== false),
+    ...(dryRun === true && { dryRun: true }),
+    sourceId,
+    ...(batchSize !== undefined && { batchSize }),
+    ...(priority !== undefined && { priority }),
+    ...(catchUp === true && { catchUp: true }),
+    ...(includeNullSignature === true && { includeNullSignature: true }),
+    ...(pace !== undefined && { pace, paceFromBackground: true }),
+  };
+}
+
+type EmbedJobRunner = (engine: BrainEngine, opts: EmbedOpts) => Promise<EmbedResult>;
+
+export async function runEmbedJob(
+  engine: BrainEngine,
+  data: Record<string, unknown>,
+  runtime: {
+    signal: AbortSignal;
+    onProgress: (done: number, total: number, embedded: number) => void;
+  },
+  runner?: EmbedJobRunner,
+): Promise<EmbedResult> {
+  const run = runner ?? (await import('./embed.ts')).runEmbedCore;
+  const result = await run(engine, {
+    ...resolveEmbedJobData(data),
+    signal: runtime.signal,
+    onProgress: runtime.onProgress,
+  });
+  // A cooperative embed loop returns its partial counters after cancellation.
+  // Do not let the worker interpret that normal unwind as a completed job.
+  throwIfAborted(runtime.signal, 'embed job');
+  if (result.failures > 0) {
+    throw new Error(
+      `embed job left ${result.failures} failed chunk(s): ${result.failure_samples[0] ?? 'unknown error'}`,
+    );
+  }
+  return result;
 }
 
 /** Parse `--max-waiting N` from CLI args. Returns undefined if absent.
@@ -1525,33 +1722,13 @@ export async function registerBuiltinHandlers(
   });
 
   registerBuiltinJob(worker, engine, 'embed', async (job) => {
-    const { runEmbedCore } = await import('./embed.ts');
     // Primary Minion progress channel is job.updateProgress (DB-backed,
     // readable via `gbrain jobs get <id>`). Stderr from the worker daemon
     // only emits coarse job-start / job-done lines; per-page detail lives
     // in the DB. Per Codex review #20.
-    const embedResult = await runEmbedCore(engine, {
-      slug: typeof job.data.slug === 'string' ? job.data.slug : undefined,
-      slugs: Array.isArray(job.data.slugs) ? (job.data.slugs as string[]) : undefined,
-      all: !!job.data.all,
-      stale: job.data.all ? false : (job.data.stale !== false),
-      // `embed --background` serializes dryRun into the payload (embed.ts's
-      // job-args builder). Not reading it back here meant a backgrounded
-      // preview embedded for real: API spend and NULL->vector writes from an
-      // invocation whose whole point was to do neither.
-      dryRun: !!job.data.dryRun,
-      sourceId: typeof job.data.sourceId === 'string' ? job.data.sourceId : undefined,
-      // CX1+CX5: pace overrides ride in the job payload as explicit overrides
-      // only; runEmbedCore re-resolves env > config > bundle at execution so
-      // GBRAIN_PACE_* still wins during an incident.
-      ...(job.data.pace && typeof job.data.pace === 'object'
-        ? {
-            pace: job.data.pace as { perCallMode?: string; perCall?: PaceKeyOverrides },
-            // Serialized from the queued payload → config tier so GBRAIN_PACE_*
-            // on the worker still wins at execution (Codex P2 escape hatch).
-            paceFromBackground: true,
-          }
-        : {}),
+    const embedResult = await runEmbedJob(engine, job.data, {
+      // Runtime cancellation is trusted worker state, never job payload.
+      signal: job.signal,
       onProgress: (done, total, embedded) => {
         // Fire-and-forget: progress updates are best-effort and must not
         // block the worker loop.

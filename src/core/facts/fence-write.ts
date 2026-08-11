@@ -34,12 +34,14 @@
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, appendFileSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { dirname, relative as durabilityPathRelative, isAbsolute as durabilityPathIsAbsolute } from 'node:path';
 
 import type { BrainEngine, NewFact, FactVisibility } from '../engine.ts';
 import { resolvePageFilePath } from '../markdown.ts';
 import { withPageLock } from '../page-lock.ts';
 import { gbrainPath } from '../config.ts';
+import { execFileSync } from 'node:child_process';
+import { isDurabilityHardened, commitWriteThroughExpectedContent } from '../brain-repo-durability.ts';
 import { upsertFactRow, parseFactsFence } from '../facts-fence.ts';
 import { extractFactsFromFenceText } from './extract-from-fence.ts';
 import { logStubGuardEvent } from './stub-guard-audit.ts';
@@ -119,6 +121,63 @@ function recordWriteFailure(slug: string, sourceId: string, warnings: string[], 
   }
 }
 
+// eli-patch facts-fence-durability 2026-08-02
+// Keep this local compatibility block path-limited. It must never stage a
+// repository-wide dirty set: facts absorption can overlap human edits and
+// other writers in the same brain checkout.
+const FACTS_DURABILITY_RETRY_MS = [0, 50, 200] as const;
+type FactFenceGitPathState = 'clean' | 'dirty' | 'unknown';
+
+function factFenceGitPathState(repoPath: string, filePath: string): FactFenceGitPathState {
+  try {
+    const rel = durabilityPathRelative(repoPath, filePath);
+    if (!rel || rel.startsWith('..') || durabilityPathIsAbsolute(rel)) return 'unknown';
+    const status = execFileSync(
+      'git',
+      ['-C', repoPath, 'status', '--porcelain=v1', '--untracked-files=all', '--', rel],
+      { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: process.env },
+    );
+    return status.trim().length === 0 ? 'clean' : 'dirty';
+  } catch {
+    return 'unknown';
+  }
+}
+
+async function commitFactFenceDurably(
+  repoPath: string,
+  filePath: string,
+  slug: string,
+  sourceId: string,
+  prewriteState: FactFenceGitPathState,
+  expectedContent: string,
+): Promise<void> {
+  if (prewriteState !== 'clean') {
+    recordWriteFailure(
+      slug,
+      sourceId,
+      [prewriteState === 'dirty'
+        ? 'git_durability_preexisting_dirty'
+        : 'git_durability_prewrite_state_unknown'],
+      filePath,
+    );
+    return;
+  }
+
+  for (const delayMs of FACTS_DURABILITY_RETRY_MS) {
+    if (delayMs > 0) {
+      await new Promise(resolve => setTimeout(resolve, delayMs));
+    }
+    if (commitWriteThroughExpectedContent(repoPath, filePath, slug, expectedContent)) return;
+  }
+
+  recordWriteFailure(
+    slug,
+    sourceId,
+    ['git_durability_commit_failed'],
+    filePath,
+  );
+}
+
 /**
  * Stub-create body for a new entity page. Minimum frontmatter so the
  * page validates as gbrain-canonical markdown and survives an
@@ -178,6 +237,7 @@ export async function writeFactsToFence(
   // the put_page write-through and dream-cycle reverse-render compute. The
   // bare join wrote main-source fences to the repo ROOT (the default source's
   // tree), polluting ~/brain with stray root-level fence files.
+  const durabilityRepoPath = target.localPath;
   const filePath = resolvePageFilePath(target.localPath, target.slug, target.sourceId);
   const tmpPath = `${filePath}.tmp`;
 
@@ -185,6 +245,10 @@ export async function writeFactsToFence(
     target.slug,
     async () => {
       // 1. Read existing body or stub-create.
+      const durabilityEnabled = isDurabilityHardened(durabilityRepoPath);
+      const durabilityPrewriteState = durabilityEnabled
+        ? factFenceGitPathState(durabilityRepoPath, filePath)
+        : 'clean';
       let body: string;
       if (existsSync(filePath)) {
         body = readFileSync(filePath, 'utf-8');
@@ -325,6 +389,16 @@ export async function writeFactsToFence(
       }));
 
       const result = await engine.insertFacts(enriched, { source_id: target.sourceId }); // gbrain-allow-direct-insert: writeFactsToFence is the markdown-first reconcile path; runs only after the atomic fence write commits
+      if (durabilityEnabled) {
+        await commitFactFenceDurably(
+          durabilityRepoPath,
+          filePath,
+          target.slug,
+          target.sourceId,
+          durabilityPrewriteState,
+          body,
+        );
+      }
       return { inserted: result.inserted, ids: result.ids };
     },
     { timeoutMs: 5_000 },

@@ -276,6 +276,35 @@ describe('embedStaleForSource', () => {
     // The stale text row actually got its embedding.
     expect(txtRow.embedded_at).not.toBeNull();
   });
+
+  test('concurrent re-chunk during provider await is never overwritten or deleted', async () => {
+    await seedPageWithStaleChunks('race-page', 2);
+
+    const result = await embedStaleForSource(engine, 'default', {
+      concurrency: 1,
+      embedFn: async (texts) => {
+        expect(texts).toHaveLength(2);
+        // Simulate sync/import winning while the external embedding request is
+        // in flight. The old merge+upsert path restored old[0,1] afterward and
+        // deleted the new third chunk as "missing" from its stale snapshot.
+        await engine.upsertChunks('race-page', [
+          { chunk_index: 0, chunk_text: 'new chunk 0', chunk_source: 'compiled_truth' },
+          { chunk_index: 1, chunk_text: 'new chunk 1', chunk_source: 'compiled_truth' },
+          { chunk_index: 2, chunk_text: 'new chunk 2', chunk_source: 'compiled_truth' },
+        ]);
+        return fakeEmbedFn(texts);
+      },
+    });
+
+    expect(result.embedded).toBe(0);
+    const chunks = await engine.getChunks('race-page');
+    expect(chunks.map((chunk) => chunk.chunk_text)).toEqual([
+      'new chunk 0',
+      'new chunk 1',
+      'new chunk 2',
+    ]);
+    expect(await engine.countStaleChunks({ sourceId: 'default' })).toBe(3);
+  });
 });
 
 // ────────────────────────────────────────────────────────────────
@@ -341,7 +370,7 @@ describe('contextual-retrieval wrapping on re-embed (#3507)', () => {
     expect(rows[0].contextual_retrieval_mode).toBe('title');
   });
 
-  test('unstamped page (NULL mode) embeds raw chunk_text — convention preserved', async () => {
+  test('unstamped page (NULL mode) resolves the live mode and stamps it', async () => {
     await seedWrappablePage('plain-page', 'Plain Notes');
     // No updatePageContextualRetrievalState call: pre-CR page.
 
@@ -349,7 +378,10 @@ describe('contextual-retrieval wrapping on re-embed (#3507)', () => {
     const result = await embedStaleForSource(engine, 'default', { embedFn: capturingEmbedFn(seen) });
     expect(result.embedded).toBe(2);
 
-    expect(seen).toContain('prose chunk about widgets');
-    expect(seen.some((t) => t.startsWith('<context>'))).toBe(false);
+    expect(seen).toContain('<context>Plain Notes\n</context>\nprose chunk about widgets');
+    const rows = await engine.executeRaw<{ contextual_retrieval_mode: string }>(
+      `SELECT contextual_retrieval_mode FROM pages WHERE slug = 'plain-page'`,
+    );
+    expect(rows[0].contextual_retrieval_mode).toBe('title');
   });
 });

@@ -81,6 +81,14 @@ export const CYCLE_DEADLINE_RESERVE_MS = 60 * 1000;
  */
 export const MIN_PATTERNS_SUBAGENT_BUDGET_MS = 2 * 60 * 1000;
 
+export function patternChildOutcomeVerdict(
+  outcome: string,
+  writtenCount: number,
+): 'success' | 'partial' | 'failed' {
+  if (outcome === 'completed') return 'success';
+  return writtenCount > 0 ? 'partial' : 'failed';
+}
+
 /**
  * Clamp the configured subagent budgets to the remaining parent-job time.
  * Both timeouts derive from the SAME absolute child deadline
@@ -260,8 +268,12 @@ export async function runPhasePatterns(
     // returned status:ok even when the subagent timed out (e.g. no
     // subagent-capable worker slot free for the whole wait window) and zero
     // pattern pages were written — a silent no-op for days.
-    if (outcome !== 'complete') {
-      if (writtenRefs.length === 0) {
+    // waitForCompletion returns the MinionJob DB status (`completed`), not
+    // the child_done inbox outcome (`complete`). Comparing the two contracts
+    // made every successful patterns child look partial or failed.
+    const childVerdict = patternChildOutcomeVerdict(outcome, writtenRefs.length);
+    if (childVerdict !== 'success') {
+      if (childVerdict === 'failed') {
         return {
           phase: 'patterns',
           status: 'fail',

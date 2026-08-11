@@ -16,6 +16,7 @@ import type { BrainHealth } from '../core/types.ts';
 import { buildChecks, computeDoctorReport, type DoctorReport, type Check } from './doctor.ts';
 import { extractStaleFromDB } from './extract.ts';
 import { runCycle, type CycleReport } from '../core/cycle.ts';
+import type { CycleStatus } from '../core/cycle.ts';
 
 type ActionStatus = 'ok' | 'would_apply' | 'applied' | 'blocked' | 'skipped';
 
@@ -44,6 +45,20 @@ export interface MaintainReport {
     health: BrainHealth;
     doctor: DoctorReport;
   };
+}
+
+/**
+ * Scheduled callers must not record a successful maintenance run when a
+ * requested action was blocked. Doctor warnings may legitimately remain after
+ * a bounded safe pass, so only the action verdict controls the process exit.
+ */
+export function maintainExitCode(report: MaintainReport | void): number {
+  return report?.actions.some((action) => action.status === 'blocked') ? 1 : 0;
+}
+
+/** A freshness action is complete only when the cycle itself completed. */
+export function cycleMaintenanceActionStatus(status: CycleStatus): ActionStatus {
+  return status === 'ok' || status === 'clean' ? 'applied' : 'blocked';
 }
 
 export function parseMaintainArgs(args: string[]): MaintainOptions {
@@ -146,7 +161,7 @@ async function runCycleFreshnessMaintenance(
     });
     actions.push({
       name: 'cycle_freshness',
-      status: report.status === 'failed' ? 'blocked' : 'applied',
+      status: cycleMaintenanceActionStatus(report.status),
       message: `Ran source-scoped dream cycle for ${sourceId}: ${report.status}.`,
       details: {
         source_id: sourceId,

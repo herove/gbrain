@@ -14,9 +14,19 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
-import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import {
+  appendFileSync,
+  chmodSync,
+  mkdtempSync,
+  rmSync,
+  existsSync,
+  readFileSync,
+  writeFileSync,
+  mkdirSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { execFileSync } from 'node:child_process';
 
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { writeFactsToFence, lookupSourceLocalPath } from '../src/core/facts/fence-write.ts';
@@ -60,6 +70,30 @@ const baseInput = (overrides: Partial<FenceInputFact> = {}): FenceInputFact => (
   sessionId: null,
   ...overrides,
 });
+
+function git(...args: string[]): string {
+  return execFileSync('git', ['-C', brainDir, ...args], {
+    encoding: 'utf-8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  }).trim();
+}
+
+function initializeHardenedBrainRepo(): void {
+  git('init');
+  git('config', 'user.email', 'gbrain-test@example.invalid');
+  git('config', 'user.name', 'GBrain Test');
+  writeFileSync(join(brainDir, 'seed.md'), 'seed\n');
+  git('add', 'seed.md');
+  git('commit', '-m', 'seed');
+  const hookPath = join(brainDir, '.git/hooks/post-commit');
+  writeFileSync(hookPath, [
+    '#!/bin/sh',
+    '# gbrain brain-durability post-commit hook (v0.42.44+)',
+    'exit 0',
+    '',
+  ].join('\n'));
+  chmodSync(hookPath, 0o755);
+}
 
 describe('writeFactsToFence — happy path', () => {
   test('stub-creates entity page when none exists, writes fence, stamps DB', async () => {
@@ -221,6 +255,39 @@ describe('writeFactsToFence — atomic recovery', () => {
     const tmpPath = join(brainDir, 'people/erin.md.tmp');
     expect(existsSync(tmpPath)).toBe(false);
   });
+});
+
+describe('writeFactsToFence — Git durability', () => {
+  test('commits the exact fence snapshot and leaves a concurrent same-file edit dirty', async () => {
+    initializeHardenedBrainRepo();
+    writeFileSync(join(brainDir, 'seed.md'), 'unrelated human edit\n');
+    const slug = 'people/race';
+    const filePath = join(brainDir, `${slug}.md`);
+
+    const concurrentEngine = Object.create(engine) as PGLiteEngine;
+    const insertFacts = engine.insertFacts.bind(engine);
+    concurrentEngine.insertFacts = async (...args: Parameters<typeof engine.insertFacts>) => {
+      const inserted = await insertFacts(...args);
+      appendFileSync(filePath, '\nConcurrent human edit.\n');
+      return inserted;
+    };
+
+    const result = await writeFactsToFence(
+      concurrentEngine,
+      { sourceId: 'default', localPath: brainDir, slug },
+      [baseInput({ fact: 'Fence snapshot must be committed exactly' })],
+    );
+
+    expect(result.inserted).toBe(1);
+    const committed = git('show', `HEAD:${slug}.md`);
+    expect(committed).toContain('Fence snapshot must be committed exactly');
+    expect(committed).not.toContain('Concurrent human edit.');
+    expect(git('log', '-1', '--format=%s')).toBe(`gbrain: write-through ${slug}`);
+    expect(git('log', '-1', '--name-only', '--format=')).toBe(`${slug}.md`);
+    expect(git('status', '--porcelain', '--', `${slug}.md`)).toContain(`${slug}.md`);
+    expect(readFileSync(filePath, 'utf-8')).toContain('Concurrent human edit.');
+    expect(git('status', '--porcelain', '--', 'seed.md')).toContain('seed.md');
+  }, 60_000);
 });
 
 describe('writeFactsToFence — stub guard (v0.34.5)', () => {

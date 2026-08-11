@@ -142,22 +142,44 @@ function processLiveness(pid: number): 'alive' | 'dead' | 'unknown' {
   }
 }
 
+/** Parse BSD/Linux `ps -o etime=` (`[[dd-]hh:]mm:ss`) into milliseconds. */
+function parseElapsedMs(value: string): number | null {
+  const match = value.trim().match(/^(?:(\d+)-)?(?:(\d+):)?(\d{2}):(\d{2})$/);
+  if (!match) return null;
+  const days = Number(match[1] ?? 0);
+  const hours = Number(match[2] ?? 0);
+  const minutes = Number(match[3]);
+  const seconds = Number(match[4]);
+  if (
+    !Number.isSafeInteger(days) ||
+    !Number.isSafeInteger(hours) ||
+    !Number.isSafeInteger(minutes) ||
+    !Number.isSafeInteger(seconds) ||
+    hours > 23 ||
+    minutes > 59 ||
+    seconds > 59
+  ) return null;
+  return (((days * 24 + hours) * 60 + minutes) * 60 + seconds) * 1000;
+}
+
 /**
  * Best-effort process start time (epoch ms) via `ps`. Used for the PID-reuse
  * guard: a stale `worker-<pid>.json` plus an OS-reused pid would otherwise make
- * us report an unrelated process's niceness (Codex #8). Returns null when
- * undeterminable — callers must NOT treat null as "reused".
+ * us report an unrelated process's niceness (Codex #8). `etime` is deliberate:
+ * unlike `lstart`, it carries no timezone-less wall-clock string that can be
+ * misparsed when the process TZ differs from the host's `ps` timezone.
+ * Returns null when undeterminable — callers must NOT treat null as "reused".
  */
 function processStartMs(pid: number): number | null {
   try {
-    const out = execFileSync('ps', ['-o', 'lstart=', '-p', String(pid)], {
+    const out = execFileSync('ps', ['-o', 'etime=', '-p', String(pid)], {
       encoding: 'utf8',
       timeout: 2000,
       stdio: ['ignore', 'pipe', 'ignore'],
     }).trim();
     if (!out) return null;
-    const t = Date.parse(out);
-    return Number.isNaN(t) ? null : t;
+    const elapsedMs = parseElapsedMs(out);
+    return elapsedMs === null ? null : Date.now() - elapsedMs;
   } catch {
     return null;
   }

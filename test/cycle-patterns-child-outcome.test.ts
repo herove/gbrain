@@ -12,7 +12,7 @@
  * the real Anthropic call fails immediately, exhausting max_attempts and
  * landing the job in 'dead' (not 'timeout' — nothing ever times out, the
  * failure is immediate). The #2782 status-reflects-outcome contract this
- * test exists to pin is unchanged: any non-'complete' outcome with zero
+ * test exists to pin is unchanged: any non-'completed' Minion status with zero
  * writes must still surface as status 'fail', just under the outcome that
  * actually occurs now that the job is drained instead of left stuck in
  * 'waiting' for the full wait window.
@@ -24,8 +24,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
-import { runPhasePatterns } from '../src/core/cycle/patterns.ts';
+import { patternChildOutcomeVerdict, runPhasePatterns } from '../src/core/cycle/patterns.ts';
 import { withEnv } from './helpers/with-env.ts';
+import { readFileSync } from 'node:fs';
 
 let engine: PGLiteEngine;
 let schemaVersion: string;
@@ -64,6 +65,22 @@ async function seedReflections(): Promise<void> {
 }
 
 describe('runPhasePatterns child-outcome status (#2782)', () => {
+  test('uses the completed Minion DB status as the success guard', () => {
+    const source = readFileSync(
+      new URL('../src/core/cycle/patterns.ts', import.meta.url),
+      'utf8',
+    );
+    expect(source).toContain("if (outcome === 'completed') return 'success'");
+    expect(source).not.toContain("if (outcome === 'complete') return 'success'");
+  });
+
+  test('maps the Minion terminal status contract behaviorally', () => {
+    expect(patternChildOutcomeVerdict('completed', 0)).toBe('success');
+    expect(patternChildOutcomeVerdict('dead', 1)).toBe('partial');
+    expect(patternChildOutcomeVerdict('dead', 0)).toBe('failed');
+    expect(patternChildOutcomeVerdict('timeout', 0)).toBe('failed');
+  });
+
   test('child dead with zero writes → status fail (was silent ok)', async () => {
     const brainDir = mkdtempSync(join(tmpdir(), 'gbrain-patterns-outcome-'));
     try {
